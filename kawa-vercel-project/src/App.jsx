@@ -509,7 +509,7 @@ function OrderForm({ initial, clients, lists, orders, catalog, onSave, onCancel,
       <Field label="Tipo de pedido">
         <div className="flex gap-2">
           <button onClick={() => set('tipo', 'Personalizado')} className="flex-1 rounded-xl py-2 text-sm font-medium" style={{ background: f.tipo === 'Personalizado' ? C.wine : C.line, color: f.tipo === 'Personalizado' ? '#fff' : C.ink }}>Personalizado</button>
-          <button onClick={() => set('tipo', 'Catálogo')} className="flex-1 rounded-xl py-2 text-sm font-medium" style={{ background: f.tipo === 'Catálogo' ? C.wine : C.line, color: f.tipo === 'Catálogo' ? '#fff' : C.ink }}>De catálogo</button>
+          <button onClick={() => set('tipo', 'Catálogo')} className="flex-1 rounded-xl py-2 text-sm font-medium" style={{ background: f.tipo === 'Catálogo' ? C.wine : C.line, color: f.tipo === 'Catálogo' ? '#fff' : C.ink }}>De colección</button>
         </div>
       </Field>
 
@@ -613,7 +613,7 @@ function OrderForm({ initial, clients, lists, orders, catalog, onSave, onCancel,
         <Field label="Precio" required>
           <TextInput type="number" inputMode="numeric" placeholder="0" value={f.precio} onChange={e => set('precio', e.target.value)} />
         </Field>
-        <Field label="Abono">
+        <Field label={initial ? 'Abono' : 'Primer abono'}>
           <TextInput type="number" inputMode="numeric" placeholder="0" value={f.abono} onChange={e => set('abono', e.target.value)} />
         </Field>
       </div>
@@ -631,6 +631,8 @@ function OrderForm({ initial, clients, lists, orders, catalog, onSave, onCancel,
           </button>
         ))}
       </div>
+
+      {!initial && <p className="text-xs -mt-2 mb-3" style={{ color: C.inkSoft }}>El segundo abono (y los siguientes) los agregas después, desde el detalle del pedido.</p>}
 
       <div className="rounded-xl px-3 py-2.5 mb-3" style={{ background: C.line }}>
         <div className="flex items-center justify-between text-sm mb-1.5">
@@ -706,11 +708,32 @@ function OrderForm({ initial, clients, lists, orders, catalog, onSave, onCancel,
 /* ------------------------------------------------------------------ */
 /*  Order Detail (view + move stage)                                   */
 /* ------------------------------------------------------------------ */
-function OrderDetail({ order, client, onEdit, onClose, onStageChange, onOpenCosts }) {
+const ABONO_ORDINALES = ['Primer abono', 'Segundo abono', 'Tercer abono', 'Cuarto abono', 'Quinto abono'];
+function nombreAbono(i) { return ABONO_ORDINALES[i] || `Abono ${i + 1}`; }
+
+function OrderDetail({ order, client, lists, onEdit, onClose, onStageChange, onOpenCosts, onAddAbono, onDeleteAbono }) {
   const idx = ETAPA_KEYS.indexOf(order.etapa);
   const saldo = (Number(order.precio) || 0) - (Number(order.abono) || 0);
   const pct = pctPagado(order.precio, order.abono);
   const fotos = (order.fotos && order.fotos.length) ? order.fotos : (order.foto ? [order.foto] : []);
+
+  const abonosMostrados = (order.abonos && order.abonos.length)
+    ? order.abonos
+    : ((Number(order.abono) || 0) > 0
+      ? [{ id: '__legacy', monto: Number(order.abono), medioPago: order.medioPago || 'Efectivo', fecha: (order.createdAt || '').slice(0, 10) }]
+      : []);
+
+  const [addingAbono, setAddingAbono] = useState(false);
+  const [nuevoMonto, setNuevoMonto] = useState('');
+  const [nuevoMedio, setNuevoMedio] = useState((lists?.cuentas || ['Efectivo'])[0] || 'Efectivo');
+  const [nuevaFecha, setNuevaFecha] = useState(new Date().toISOString().slice(0, 10));
+
+  function confirmarAbono() {
+    if (!onAddAbono) return;
+    onAddAbono(nuevoMonto, nuevoMedio, nuevaFecha);
+    setNuevoMonto('');
+    setAddingAbono(false);
+  }
 
   function handleDownloadOrder() {
     const lines = [
@@ -774,12 +797,56 @@ function OrderDetail({ order, client, onEdit, onClose, onStageChange, onOpenCost
 
       <div className="rounded-xl p-3 mb-4" style={{ background: C.paper, border: `1px solid ${C.line}` }}>
         <div className="flex justify-between text-sm mb-1"><span style={{ color: C.inkSoft }}>Precio</span><span style={{ color: C.ink }}>{fmtCOP(order.precio)}</span></div>
-        <div className="flex justify-between text-sm mb-1"><span style={{ color: C.inkSoft }}>Abono</span><span style={{ color: C.ink }}>{fmtCOP(order.abono)}</span></div>
+        <div className="flex justify-between text-sm mb-1"><span style={{ color: C.inkSoft }}>Total abonado</span><span style={{ color: C.ink }}>{fmtCOP(order.abono)}</span></div>
         <div className="flex justify-between text-sm font-semibold mb-2"><span style={{ color: C.ink }}>Saldo</span><span style={{ color: saldo > 0 ? C.brick : C.sage }}>{fmtCOP(saldo)}</span></div>
         <div className="h-1.5 rounded-full overflow-hidden mb-1" style={{ background: C.line }}>
           <div className="h-full rounded-full" style={{ width: `${pct}%`, background: C.wine }} />
         </div>
-        <p className="text-xs text-right font-medium" style={{ color: C.wine }}>{pct}% pagado</p>
+        <p className="text-xs text-right font-medium mb-3" style={{ color: C.wine }}>{pct}% pagado</p>
+
+        {abonosMostrados.length > 0 && (
+          <div className="space-y-1.5 mb-1 pt-2" style={{ borderTop: `1px solid ${C.line}` }}>
+            {abonosMostrados.map((a, i) => (
+              <div key={a.id} className="flex items-center justify-between text-xs">
+                <div>
+                  <span className="font-medium" style={{ color: C.ink }}>{nombreAbono(i)}</span>
+                  <span style={{ color: C.inkSoft }}> · {a.medioPago || 'Efectivo'}{a.fecha ? ` · ${fmtDate(a.fecha)}` : ''}</span>
+                </div>
+                <div className="flex items-center gap-1.5">
+                  <span className="font-semibold" style={{ color: C.ink }}>{fmtCOP(a.monto)}</span>
+                  {onDeleteAbono && a.id !== '__legacy' && (
+                    <button onClick={() => onDeleteAbono(a.id)} className="w-5 h-5 rounded-full flex items-center justify-center" style={{ background: C.line }}>
+                      <X size={10} style={{ color: C.inkSoft }} />
+                    </button>
+                  )}
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+
+        {saldo > 0 && !addingAbono && (
+          <button onClick={() => setAddingAbono(true)} className="w-full rounded-lg py-2 mt-2 text-xs font-semibold" style={{ background: C.line, color: C.wine }}>
+            + Agregar {nombreAbono(abonosMostrados.length).toLowerCase()}
+          </button>
+        )}
+
+        {addingAbono && (
+          <div className="mt-2 pt-2 space-y-2" style={{ borderTop: `1px solid ${C.line}` }}>
+            <div className="grid grid-cols-2 gap-2">
+              <TextInput type="number" inputMode="numeric" placeholder="Monto" value={nuevoMonto} onChange={e => setNuevoMonto(e.target.value)} />
+              <Select value={nuevoMedio} onChange={e => setNuevoMedio(e.target.value)}>
+                {(lists?.cuentas || ['Efectivo']).map(o => <option key={o}>{o}</option>)}
+              </Select>
+            </div>
+            <TextInput type="date" value={nuevaFecha} onChange={e => setNuevaFecha(e.target.value)} />
+            <div className="flex gap-2">
+              <GhostButton full onClick={() => { setAddingAbono(false); setNuevoMonto(''); }}>Cancelar</GhostButton>
+              <PrimaryButton full onClick={confirmarAbono}>Guardar abono</PrimaryButton>
+            </div>
+          </div>
+        )}
+        {saldo <= 0 && <p className="text-xs text-center font-medium mt-1" style={{ color: C.sage }}>Pedido pagado en su totalidad 🎉</p>}
       </div>
 
       {order.observaciones && (
@@ -1497,7 +1564,15 @@ function QuoteEditor({ initial, lists, clients, onSave, onDelete, onConvert, onC
       <div className="grid grid-cols-2 gap-3">
         <Field label="Fecha"><TextInput type="date" value={q.fecha} onChange={e => setQ({ ...q, fecha: e.target.value })} /></Field>
         <Field label="Estado">
-          <Select value={q.estado} onChange={e => setQ({ ...q, estado: e.target.value })}>
+          <Select value={q.estado} onChange={e => {
+            const val = e.target.value;
+            setQ(prev => ({ ...prev, estado: val }));
+            if (val === 'Convertida a pedido' && !(q.orderIds?.length > 0)) {
+              // Elegir este estado convierte la cotización en pedido de una vez,
+              // en lugar de solo dejar la etiqueta puesta.
+              handleConvert();
+            }
+          }}>
             {ESTADOS_COTIZACION.map(s => <option key={s.key}>{s.key}</option>)}
           </Select>
         </Field>
@@ -3069,7 +3144,10 @@ export default function App() {
       if (data.tipo === 'Catálogo' && data.prendaCatalogoId) {
         adjustStock(data.coleccionId, data.prendaCatalogoId, -1);
       }
-      saveOrders([...orders, { id: uid(), ...data, createdAt: new Date().toISOString() }]);
+      const abonos = (Number(data.abono) || 0) > 0
+        ? [{ id: uid(), monto: Number(data.abono), medioPago: data.medioPago || 'Efectivo', fecha: new Date().toISOString().slice(0, 10) }]
+        : [];
+      saveOrders([...orders, { id: uid(), ...data, abonos, createdAt: new Date().toISOString() }]);
     }
     setOrderModal(null);
   }
@@ -3083,6 +3161,30 @@ export default function App() {
   }
   function handleStageChange(order, etapa) {
     const updated = { ...order, etapa };
+    saveOrders(orders.map(o => o.id === order.id ? updated : o));
+    setOrderDetail(updated);
+  }
+  function handleAddAbono(order, monto, medioPago, fecha) {
+    const montoNum = Number(monto) || 0;
+    if (montoNum <= 0) return;
+    // Si el pedido ya tenía un abono "suelto" (de la versión anterior, sin
+    // historial), lo convertimos en el primer abono de la lista para no
+    // perder ese dinero ya registrado.
+    const existentes = (order.abonos && order.abonos.length)
+      ? order.abonos
+      : ((Number(order.abono) || 0) > 0
+        ? [{ id: uid(), monto: Number(order.abono), medioPago: order.medioPago || 'Efectivo', fecha: (order.createdAt || '').slice(0, 10) || fecha }]
+        : []);
+    const abonos = [...existentes, { id: uid(), monto: montoNum, medioPago, fecha }];
+    const totalAbono = abonos.reduce((s, a) => s + (Number(a.monto) || 0), 0);
+    const updated = { ...order, abonos, abono: totalAbono };
+    saveOrders(orders.map(o => o.id === order.id ? updated : o));
+    setOrderDetail(updated);
+  }
+  function handleDeleteAbono(order, abonoId) {
+    const abonos = (order.abonos || []).filter(a => a.id !== abonoId);
+    const totalAbono = abonos.reduce((s, a) => s + (Number(a.monto) || 0), 0);
+    const updated = { ...order, abonos, abono: totalAbono };
     saveOrders(orders.map(o => o.id === order.id ? updated : o));
     setOrderDetail(updated);
   }
@@ -3284,10 +3386,13 @@ export default function App() {
           <OrderDetail
             order={orderDetail}
             client={clients.find(c => c.id === orderDetail.clientId)}
+            lists={lists}
             onClose={() => setOrderDetail(null)}
             onEdit={() => { setOrderModal({ mode: 'edit', order: orderDetail }); setOrderDetail(null); }}
             onStageChange={etapa => handleStageChange(orderDetail, etapa)}
             onOpenCosts={() => setOrderCostsModal(orderDetail)}
+            onAddAbono={(monto, medioPago, fecha) => handleAddAbono(orderDetail, monto, medioPago, fecha)}
+            onDeleteAbono={abonoId => handleDeleteAbono(orderDetail, abonoId)}
           />
         </Sheet>
       )}
