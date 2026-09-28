@@ -239,6 +239,44 @@ function computeQuoteTotals(q) {
     return acc;
   }, {});
 }
+// Presupuesto de gasto de una prenda: lo cotizado para producirla (insumos + margen
+// de error + corte + ensamble + envío) contra lo que ya se ha gastado de verdad.
+function computeGastoPrenda(c) {
+  if (!c) return null;
+  const t = computePrendaTotals(c);
+  const presupuesto = t.totalProduccion + (Number(c.envio) || 0);
+  let gastado = 0, count = 0;
+  const add = v => { if (v !== '' && v != null) { gastado += Number(v) || 0; count++; } };
+  (c.itemsConUnidad || []).forEach(it => add(it.valorReal));
+  (c.itemsDirectos || []).forEach(it => add(it.valorReal));
+  add(c.corteReal); add(c.ensambleReal); add(c.envioReal);
+  return { presupuesto, gastado, disponible: presupuesto - gastado, count };
+}
+// Filas comparativas cotizado vs real (para la pestaña de comparación)
+function buildComparativo(c) {
+  if (!c) return [];
+  const rows = [];
+  const push = (grupo, nombre, cot, real) => rows.push({ grupo, nombre, cot: Number(cot) || 0, real: (real === '' || real == null) ? null : (Number(real) || 0) });
+  (c.itemsConUnidad || []).forEach(it => push(it.categoria === 'Tela' ? 'Telas' : 'Insumos', it.nombre, (Number(it.unidades) || 0) * (Number(it.valorUnidad) || 0), it.valorReal));
+  (c.itemsDirectos || []).forEach(it => push('Accesorios y costos fijos', it.nombre, it.valor, it.valorReal));
+  push('Mano de obra', 'Corte', c.corte, c.corteReal);
+  push('Mano de obra', 'Ensamble', c.ensamble, c.ensambleReal);
+  if (Number(c.envio) > 0 || (c.envioReal !== '' && c.envioReal != null)) push('Envío', 'Envío', c.envio, c.envioReal);
+  return rows;
+}
+
+function getOrderCotizacion(order, quotes) {
+  if (order.cotizacion?.prenda) return order.cotizacion;
+  const q = (quotes || []).find(x => x.id === order.quoteId) || (quotes || []).find(x => (x.orderIds || []).includes(order.id));
+  if (q) {
+    const nq = normalizeQuote(q);
+    const i = (nq.orderIds || []).indexOf(order.id);
+    const prenda = nq.prendas[i] || nq.prendas.find(p => p.nombre === order.prenda) || nq.prendas[0];
+    if (prenda) return { fecha: nq.fecha, asesor: nq.asesor, notas: nq.notas, prenda, deCotizacionActual: true };
+  }
+  return null;
+}
+
 function computeRealTotals(p) {
   let cot = 0, real = 0, count = 0;
   p.itemsConUnidad.forEach(it => {
@@ -254,7 +292,13 @@ function computeRealTotals(p) {
   });
   if (p.corteReal !== '' && p.corteReal != null) { cot += Number(p.corte) || 0; real += Number(p.corteReal) || 0; count++; }
   if (p.ensambleReal !== '' && p.ensambleReal != null) { cot += Number(p.ensamble) || 0; real += Number(p.ensambleReal) || 0; count++; }
-  return { cot, real, diff: cot - real, count };
+  if (p.envioReal !== '' && p.envioReal != null) { cot += Number(p.envio) || 0; real += Number(p.envioReal) || 0; count++; }
+  // La comisión no se "compra" con factura, pero sí es un costo real del
+  // negocio: se suma igual a ambos lados (cotizado y real) para que quede
+  // reflejada en el costo real total sin afectar el ahorro/sobrecosto.
+  const comisionValor = computePrendaTotals(p).comisionValor || 0;
+  cot += comisionValor; real += comisionValor;
+  return { cot, real, diff: cot - real, count, comisionValor };
 }
 
 function resizeImage(file, maxW = 480) {
@@ -414,6 +458,7 @@ function OrderCard({ order, client, onClick }) {
   const urgent = order.prioridad === 'Alta' && order.etapa !== 'Entregado';
   const late = du < 0 && order.etapa !== 'Entregado';
   const thumb = order.fotos?.[0] || order.foto;
+  const gasto = computeGastoPrenda(order.costos);
   return (
     <button onClick={onClick} className="w-full text-left rounded-2xl p-3.5 flex gap-3 mb-2.5 active:opacity-80" style={{ background: C.paper, border: `1px solid ${C.line}` }}>
       <div className="w-14 h-14 rounded-xl flex-shrink-0 overflow-hidden flex items-center justify-center" style={{ background: C.cream }}>
@@ -438,6 +483,14 @@ function OrderCard({ order, client, onClick }) {
           {late && <Badge bg={C.brick}>Atrasado</Badge>}
           {!late && urgent && <Badge bg={C.brick}>Urgente</Badge>}
         </div>
+        <p className="text-xs mt-1.5" style={{ color: late ? C.brick : C.inkSoft }}>
+          Entrega: <span className="font-medium">{fmtDate(order.fechaEntrega)}</span>
+        </p>
+        {gasto && (
+          <p className="text-xs mt-0.5" style={{ color: gasto.disponible >= 0 ? C.sage : C.brick }}>
+            {gasto.disponible >= 0 ? 'Disponible para gastos' : 'Gastos excedidos en'}: <span className="font-semibold">{fmtCOP(Math.abs(gasto.disponible))}</span>
+          </p>
+        )}
       </div>
     </button>
   );
@@ -711,7 +764,9 @@ function OrderForm({ initial, clients, lists, orders, catalog, onSave, onCancel,
 const ABONO_ORDINALES = ['Primer abono', 'Segundo abono', 'Tercer abono', 'Cuarto abono', 'Quinto abono'];
 function nombreAbono(i) { return ABONO_ORDINALES[i] || `Abono ${i + 1}`; }
 
-function OrderDetail({ order, client, lists, onEdit, onClose, onStageChange, onOpenCosts, onAddAbono, onDeleteAbono }) {
+function OrderDetail({ order, client, lists, cotizacion, onEdit, onClose, onStageChange, onOpenCosts, onSaveCostos, onAddAbono, onDeleteAbono }) {
+  const [vista, setVista] = useState('resumen');
+  const gasto = computeGastoPrenda(order.costos);
   const idx = ETAPA_KEYS.indexOf(order.etapa);
   const saldo = (Number(order.precio) || 0) - (Number(order.abono) || 0);
   const pct = pctPagado(order.precio, order.abono);
@@ -760,8 +815,41 @@ function OrderDetail({ order, client, lists, onEdit, onClose, onStageChange, onO
     downloadText(`Pedido_${order.codigo}.txt`, lines.join('\n'));
   }
 
+  const vistas = [
+    { key: 'resumen', label: 'Pedido' },
+    ...(cotizacion ? [{ key: 'cotizacion', label: 'Ver cotización' }] : []),
+    ...(order.costos ? [{ key: 'comparativo', label: 'Cotizado vs real' }] : []),
+  ];
+
   return (
     <div>
+      {vistas.length > 1 && (
+        <div className="flex gap-2 mb-4 overflow-x-auto pb-1">
+          {vistas.map(v => (
+            <button key={v.key} onClick={() => setVista(v.key)} className="flex-shrink-0 rounded-full px-3.5 py-1.5 text-xs font-medium" style={{ background: vista === v.key ? C.wine : C.line, color: vista === v.key ? '#fff' : C.ink }}>
+              {v.label}
+            </button>
+          ))}
+        </div>
+      )}
+
+      {vista === 'cotizacion' && cotizacion && (
+        <div>
+          <p className="text-[11px] font-mono mb-1" style={{ color: C.inkSoft }}>{order.codigo}</p>
+          <CotizacionView cot={cotizacion} />
+          <div className="mt-4"><GhostButton full onClick={() => setVista('resumen')}>Volver al pedido</GhostButton></div>
+        </div>
+      )}
+
+      {vista === 'comparativo' && order.costos && (
+        <div>
+          <p className="text-[11px] font-mono mb-1" style={{ color: C.inkSoft }}>{order.codigo} · {order.prenda}</p>
+          <ComparativoCostos order={order} onSave={onSaveCostos} onOpenFacturas={onOpenCosts} />
+          <div className="mt-4"><GhostButton full onClick={() => setVista('resumen')}>Volver al pedido</GhostButton></div>
+        </div>
+      )}
+
+      {vista === 'resumen' && (<div>
       {fotos.length > 0 && (
         <div className="flex gap-2 mb-4 overflow-x-auto">
           {fotos.map((foto, i) => (
@@ -849,6 +937,15 @@ function OrderDetail({ order, client, lists, onEdit, onClose, onStageChange, onO
         {saldo <= 0 && <p className="text-xs text-center font-medium mt-1" style={{ color: C.sage }}>Pedido pagado en su totalidad 🎉</p>}
       </div>
 
+      {gasto && (
+        <div className="rounded-xl p-3 mb-4" style={{ background: C.paper, border: `1px solid ${C.line}` }}>
+          <p className="text-[11px] uppercase tracking-wider mb-2" style={{ color: C.inkSoft }}>Gastos de la prenda</p>
+          <div className="flex justify-between text-sm mb-1"><span style={{ color: C.inkSoft }}>Presupuesto cotizado</span><span style={{ color: C.ink }}>{fmtCOP(gasto.presupuesto)}</span></div>
+          <div className="flex justify-between text-sm mb-1"><span style={{ color: C.inkSoft }}>Gastado (real)</span><span style={{ color: C.ink }}>{fmtCOP(gasto.gastado)}</span></div>
+          <div className="flex justify-between text-sm font-semibold"><span style={{ color: C.ink }}>{gasto.disponible >= 0 ? 'Disponible' : 'Excedido'}</span><span style={{ color: gasto.disponible >= 0 ? C.sage : C.brick }}>{fmtCOP(Math.abs(gasto.disponible))}</span></div>
+        </div>
+      )}
+
       {order.observaciones && (
         <div className="mb-4">
           <p className="text-[11px] uppercase tracking-wider mb-1" style={{ color: C.inkSoft }}>Observaciones</p>
@@ -883,9 +980,151 @@ function OrderDetail({ order, client, lists, onEdit, onClose, onStageChange, onO
       </button>
       {order.costos && (
         <button onClick={onOpenCosts} className="w-full rounded-xl py-2.5 mt-2 text-sm font-medium flex items-center justify-center gap-2" style={{ background: C.gold, color: C.ink }}>
-          <Calculator size={15} /> Costos reales de este pedido
+          <Calculator size={15} /> Facturas y costos reales
         </button>
       )}
+      </div>)}
+    </div>
+  );
+}
+
+/* Cotización de solo lectura (tal como quedó al convertirla en pedido) */
+function CotizacionView({ cot }) {
+  const p = cot.prenda;
+  const t = computePrendaTotals(p);
+  const rowsU = (arr) => arr.map(it => <div key={it.id} className="flex justify-between text-sm mb-1"><span style={{ color: C.inkSoft }}>{it.nombre} <span className="text-xs">({Number(it.unidades) || 0} × {fmtCOP(it.valorUnidad)})</span></span><span style={{ color: C.ink }}>{fmtCOP((Number(it.unidades) || 0) * (Number(it.valorUnidad) || 0))}</span></div>);
+  const telas = p.itemsConUnidad.filter(i => i.categoria === 'Tela');
+  const insumos = p.itemsConUnidad.filter(i => i.categoria === 'Insumo');
+  return (
+    <div>
+      <h3 className="text-xl font-semibold mb-0.5" style={{ color: C.ink, fontFamily: 'Georgia, serif' }}>{p.nombre}</h3>
+      <p className="text-xs mb-3" style={{ color: C.inkSoft }}>
+        Cotización del {fmtDate(cot.fecha)}{cot.asesor ? ` · por ${cot.asesor}` : ''}
+        {cot.deCotizacionActual ? ' · (versión actual de la cotización)' : ''}
+      </p>
+      <div className="rounded-xl p-3 mb-3" style={{ background: C.paper, border: `1px solid ${C.line}` }}>
+        {telas.length > 0 && <><SectionTitle>Telas</SectionTitle>{rowsU(telas)}</>}
+        {insumos.length > 0 && <><SectionTitle>Insumos</SectionTitle>{rowsU(insumos)}</>}
+        {p.itemsDirectos.length > 0 && <>
+          <SectionTitle>Accesorios y costos fijos</SectionTitle>
+          {p.itemsDirectos.map(it => <div key={it.id} className="flex justify-between text-sm mb-1"><span style={{ color: C.inkSoft }}>{it.nombre}</span><span style={{ color: C.ink }}>{fmtCOP(it.valor)}</span></div>)}
+        </>}
+        <SectionTitle>Mano de obra</SectionTitle>
+        <div className="flex justify-between text-sm mb-1"><span style={{ color: C.inkSoft }}>Corte</span><span style={{ color: C.ink }}>{fmtCOP(p.corte)}</span></div>
+        <div className="flex justify-between text-sm mb-1"><span style={{ color: C.inkSoft }}>Ensamble</span><span style={{ color: C.ink }}>{fmtCOP(p.ensamble)}</span></div>
+      </div>
+      <div className="rounded-xl p-3" style={{ background: C.cream }}>
+        <SummaryRow label="Total insumos base" value={t.totalBase} />
+        <SummaryRow label={`Margen de error (${p.margenError || 0}%)`} value={t.mError} />
+        <SummaryRow label="Total producción" value={t.totalProduccion} bold />
+        <SummaryRow label={`Ganancia bruta (${p.margenGanancia || 0}%)`} value={t.gananciaBruta} />
+        <SummaryRow label={`Comisión (${p.comision || 0}%)`} value={-t.comisionValor} />
+        <SummaryRow label="Ganancia neta" value={t.gananciaNeta} />
+        {(Number(p.envio) || 0) > 0 && <SummaryRow label="Envío" value={Number(p.envio)} />}
+        {(Number(p.descuento) || 0) > 0 && <SummaryRow label="Descuento" value={-Number(p.descuento)} />}
+        {(Number(p.impuesto) || 0) > 0 && <SummaryRow label="Impuesto" value={Number(p.impuesto)} />}
+        {(Number(p.gValenthina) || 0) > 0 && <SummaryRow label="G. Valenthina" value={Number(p.gValenthina)} />}
+        <div className="h-px my-2" style={{ background: C.line }} />
+        <SummaryRow label="Total de la prenda" value={t.totalPrenda} big />
+      </div>
+      {cot.notas && <p className="text-sm mt-3" style={{ color: C.inkSoft }}>Notas: {cot.notas}</p>}
+    </div>
+  );
+}
+
+/* Cuadro comparativo cotizado vs real, con costos reales editables y guardado directo en el pedido */
+function ComparativoCostos({ order, onSave, onOpenFacturas }) {
+  const [c, setC] = useState(order.costos);
+  const [saved, setSaved] = useState(false);
+  const setReal = (kind, id, v) => { setSaved(false); setC(prev => {
+    if (kind === 'u') return { ...prev, itemsConUnidad: prev.itemsConUnidad.map(it => it.id === id ? { ...it, valorReal: v } : it) };
+    if (kind === 'd') return { ...prev, itemsDirectos: prev.itemsDirectos.map(it => it.id === id ? { ...it, valorReal: v } : it) };
+    return { ...prev, [id]: v };
+  }); };
+  const groups = [
+    { titulo: 'Telas', rows: c.itemsConUnidad.filter(i => i.categoria === 'Tela').map(it => ({ key: it.id, nombre: it.nombre, cot: (Number(it.unidades) || 0) * (Number(it.valorUnidad) || 0), real: it.valorReal, set: v => setReal('u', it.id, v) })) },
+    { titulo: 'Insumos', rows: c.itemsConUnidad.filter(i => i.categoria === 'Insumo').map(it => ({ key: it.id, nombre: it.nombre, cot: (Number(it.unidades) || 0) * (Number(it.valorUnidad) || 0), real: it.valorReal, set: v => setReal('u', it.id, v) })) },
+    { titulo: 'Accesorios y costos fijos', rows: c.itemsDirectos.map(it => ({ key: it.id, nombre: it.nombre, cot: Number(it.valor) || 0, real: it.valorReal, set: v => setReal('d', it.id, v) })) },
+    { titulo: 'Mano de obra', rows: [
+      { key: 'corte', nombre: 'Corte', cot: Number(c.corte) || 0, real: c.corteReal, set: v => setReal('x', 'corteReal', v) },
+      { key: 'ensamble', nombre: 'Ensamble', cot: Number(c.ensamble) || 0, real: c.ensambleReal, set: v => setReal('x', 'ensambleReal', v) },
+    ] },
+    ...((Number(c.envio) || 0) > 0 || (c.envioReal !== '' && c.envioReal != null) ? [{ titulo: 'Envío', rows: [{ key: 'envio', nombre: 'Envío', cot: Number(c.envio) || 0, real: c.envioReal, set: v => setReal('x', 'envioReal', v) }] }] : []),
+  ].filter(g => g.rows.length > 0);
+
+  const all = groups.flatMap(g => g.rows);
+  const conReal = all.filter(r => r.real !== '' && r.real != null);
+  const totCot = all.reduce((s, r) => s + r.cot, 0);
+  const totCotReg = conReal.reduce((s, r) => s + r.cot, 0);
+  const totReal = conReal.reduce((s, r) => s + (Number(r.real) || 0), 0);
+  const gasto = computeGastoPrenda(c);
+  const diffReg = totCotReg - totReal;
+  const precio = Number(order.precio) || 0;
+  const comision = computePrendaTotals(c).comisionValor || 0;
+  const gananciaReal = precio - totReal - comision;
+
+  return (
+    <div>
+      <div className="overflow-x-auto rounded-xl mb-3" style={{ border: `1px solid ${C.line}` }}>
+        <table className="w-full text-sm" style={{ minWidth: 360 }}>
+          <thead>
+            <tr style={{ background: C.cream }}>
+              <th className="text-left px-2.5 py-2 text-[11px] uppercase tracking-wider font-medium" style={{ color: C.inkSoft }}>Concepto</th>
+              <th className="text-right px-2 py-2 text-[11px] uppercase tracking-wider font-medium" style={{ color: C.inkSoft }}>Cotizado</th>
+              <th className="text-right px-2 py-2 text-[11px] uppercase tracking-wider font-medium" style={{ color: C.inkSoft }}>Real</th>
+              <th className="text-right px-2.5 py-2 text-[11px] uppercase tracking-wider font-medium" style={{ color: C.inkSoft }}>Dif.</th>
+            </tr>
+          </thead>
+          <tbody>
+            {groups.map(g => (
+              <React.Fragment key={g.titulo}>
+                <tr style={{ background: C.paper }}><td colSpan={4} className="px-2.5 pt-2.5 pb-1 text-[11px] uppercase tracking-wider font-semibold" style={{ color: C.wine }}>{g.titulo}</td></tr>
+                {g.rows.map(r => {
+                  const has = r.real !== '' && r.real != null;
+                  const d = r.cot - (Number(r.real) || 0);
+                  return (
+                    <tr key={r.key} style={{ borderTop: `1px solid ${C.line}` }}>
+                      <td className="px-2.5 py-1.5" style={{ color: C.ink }}>{r.nombre}</td>
+                      <td className="px-2 py-1.5 text-right whitespace-nowrap" style={{ color: C.inkSoft }}>{fmtCOP(r.cot)}</td>
+                      <td className="px-1 py-1 text-right" style={{ width: 96 }}>
+                        <input type="number" inputMode="numeric" value={r.real ?? ''} placeholder="—" onChange={e => r.set(e.target.value)} className="w-full text-right rounded-lg px-2 py-1.5 text-sm outline-none" style={{ background: '#fff', border: `1px solid ${C.line}`, color: C.ink }} />
+                      </td>
+                      <td className="px-2.5 py-1.5 text-right whitespace-nowrap font-medium" style={{ color: !has ? C.inkSoft : d >= 0 ? C.sage : C.brick }}>{has ? `${d >= 0 ? '+' : '-'}${fmtCOP(Math.abs(d))}` : '—'}</td>
+                    </tr>
+                  );
+                })}
+              </React.Fragment>
+            ))}
+          </tbody>
+          <tfoot>
+            <tr style={{ borderTop: `2px solid ${C.line}`, background: C.cream }}>
+              <td className="px-2.5 py-2 font-semibold" style={{ color: C.ink }}>Total</td>
+              <td className="px-2 py-2 text-right font-semibold whitespace-nowrap" style={{ color: C.ink }}>{fmtCOP(totCot)}</td>
+              <td className="px-2 py-2 text-right font-semibold whitespace-nowrap" style={{ color: C.ink }}>{fmtCOP(totReal)}</td>
+              <td className="px-2.5 py-2 text-right font-semibold whitespace-nowrap" style={{ color: conReal.length === 0 ? C.inkSoft : diffReg >= 0 ? C.sage : C.brick }}>{conReal.length === 0 ? '—' : `${diffReg >= 0 ? '+' : '-'}${fmtCOP(Math.abs(diffReg))}`}</td>
+            </tr>
+          </tfoot>
+        </table>
+      </div>
+      <p className="text-[11px] mb-3" style={{ color: C.inkSoft }}>La diferencia compara solo lo que ya tiene valor real. Verde = ahorraste, rojo = gastaste de más.</p>
+
+      <div className="rounded-xl p-3 mb-3" style={{ background: C.paper, border: `1px solid ${C.line}` }}>
+        <div className="flex justify-between text-sm mb-1"><span style={{ color: C.inkSoft }}>Presupuesto de gastos</span><span style={{ color: C.ink }}>{fmtCOP(gasto.presupuesto)}</span></div>
+        <div className="flex justify-between text-sm mb-1"><span style={{ color: C.inkSoft }}>Gastado (real)</span><span style={{ color: C.ink }}>{fmtCOP(gasto.gastado)}</span></div>
+        <div className="flex justify-between text-sm font-semibold mb-1"><span style={{ color: C.ink }}>{gasto.disponible >= 0 ? 'Saldo disponible' : 'Excedido'}</span><span style={{ color: gasto.disponible >= 0 ? C.sage : C.brick }}>{fmtCOP(Math.abs(gasto.disponible))}</span></div>
+        {conReal.length > 0 && (
+          <div className="flex justify-between text-sm pt-1.5 mt-1" style={{ borderTop: `1px solid ${C.line}` }}>
+            <span style={{ color: C.inkSoft }}>Ganancia real (precio − gastos − comisión)</span>
+            <span className="font-semibold" style={{ color: gananciaReal >= 0 ? C.sage : C.brick }}>{fmtCOP(gananciaReal)}</span>
+          </div>
+        )}
+      </div>
+
+      <PrimaryButton full onClick={() => { onSave(c); setSaved(true); }}>Guardar costos reales</PrimaryButton>
+      {saved && <p className="text-xs text-center mt-2 font-medium" style={{ color: C.sage }}>Guardado en el pedido ✓</p>}
+      <button onClick={onOpenFacturas} className="w-full rounded-xl py-2.5 mt-2 text-sm font-medium flex items-center justify-center gap-2" style={{ background: C.line, color: C.ink }}>
+        <Camera size={15} /> Adjuntar facturas
+      </button>
     </div>
   );
 }
@@ -1619,7 +1858,7 @@ function QuoteEditor({ initial, lists, clients, onSave, onDelete, onConvert, onC
         <GhostButton full onClick={onClose}>Cerrar</GhostButton>
         <PrimaryButton full onClick={handleSave}>Guardar</PrimaryButton>
       </div>
-      {q.estado !== 'Convertida a pedido' && (
+      {!(q.orderIds?.length > 0) && q.estado !== 'Convertida a pedido' && (
         <button onClick={handleConvert} className="w-full rounded-xl py-2.5 mt-2 text-sm font-medium" style={{ background: C.gold, color: C.ink }}>
           Convertir en pedido{q.prendas.length > 1 ? 's' : ''}
         </button>
@@ -1778,6 +2017,7 @@ function OrderCostsEditor({ order, onSave, onClose }) {
   const updateItem = (arrKey, id, patch) => setCostos(prev => ({ ...prev, [arrKey]: prev[arrKey].map(it => it.id === id ? { ...it, ...patch } : it) }));
   const telas = costos.itemsConUnidad.filter(i => i.categoria === 'Tela');
   const insumos = costos.itemsConUnidad.filter(i => i.categoria === 'Insumo');
+  const comisionValor = computePrendaTotals(costos).comisionValor || 0;
 
   return (
     <div>
@@ -1795,6 +2035,16 @@ function OrderCostsEditor({ order, onSave, onClose }) {
       <SectionTitle>Mano de obra</SectionTitle>
       <ItemRow item={{ nombre: 'Corte', valor: costos.corte, valorReal: costos.corteReal, factura: costos.corteFactura }} mode="real" onChange={patch => setCostos({ ...costos, corteReal: patch.valorReal, corteFactura: patch.factura })} />
       <ItemRow item={{ nombre: 'Ensamble', valor: costos.ensamble, valorReal: costos.ensambleReal, factura: costos.ensambleFactura }} mode="real" onChange={patch => setCostos({ ...costos, ensambleReal: patch.valorReal, ensambleFactura: patch.factura })} />
+      <SectionTitle>Envío</SectionTitle>
+      <ItemRow item={{ nombre: 'Envío', valor: costos.envio, valorReal: costos.envioReal, factura: costos.envioFactura }} mode="real" onChange={patch => setCostos({ ...costos, envioReal: patch.valorReal, envioFactura: patch.factura })} />
+      <SectionTitle>Comisión</SectionTitle>
+      <div className="rounded-xl p-3 mb-2 flex items-center justify-between" style={{ background: C.paper, border: `1px solid ${C.line}` }}>
+        <div className="min-w-0 pr-2">
+          <p className="text-sm font-medium" style={{ color: C.ink }}>Comisión ({costos.comision || 20}%)</p>
+          <p className="text-xs" style={{ color: C.inkSoft }}>Se calcula sola sobre la ganancia bruta cotizada.</p>
+        </div>
+        <p className="font-semibold flex-shrink-0" style={{ color: C.ink }}>{fmtCOP(comisionValor)}</p>
+      </div>
       <div className="flex gap-2 mt-4">
         <GhostButton full onClick={onClose}>Cerrar</GhostButton>
         <PrimaryButton full onClick={() => onSave(costos)}>Guardar costos reales</PrimaryButton>
@@ -2074,7 +2324,7 @@ function FinanzasResumen({ orders, gastosFijos, transactions }) {
         <StatCard label="Total vendido" value={fmtCOP(totalVendido)} small />
         <StatCard label="Total recibido" value={fmtCOP(totalRecibido)} small accent={C.sage} />
         <StatCard label="Por cobrar" value={fmtCOP(totalPendiente)} small accent={C.brick} />
-        <StatCard label="Costos reales" value={fmtCOP(totalCostosReales)} small />
+        <StatCard label="Costo real de pedidos" value={fmtCOP(totalCostosReales)} small accent={C.brick} />
       </div>
       <StatCard label="Ganancia real de pedidos" value={fmtCOP(totalGananciaPedidos)} accent={totalGananciaPedidos >= 0 ? C.sage : C.brick} />
 
@@ -2093,7 +2343,7 @@ function FinanzasResumen({ orders, gastosFijos, transactions }) {
           <div key={o.id} className="rounded-2xl p-3.5 mb-2.5 flex items-center justify-between gap-2" style={{ background: C.paper, border: `1px solid ${C.line}` }}>
             <div className="min-w-0">
               <p className="font-medium truncate" style={{ color: C.ink }}>{o.prenda}</p>
-              <p className="text-xs" style={{ color: C.inkSoft }}>{o.codigo}</p>
+              <p className="text-xs" style={{ color: C.inkSoft }}>{o.codigo} · Costo real {fmtCOP(profit.realCost)}</p>
             </div>
             <p className="font-semibold flex-shrink-0" style={{ color: profit.ganancia >= 0 ? C.sage : C.brick }}>{fmtCOP(profit.ganancia)}</p>
           </div>
@@ -2129,12 +2379,158 @@ function FinanzasResumenMensual({ orders, transactions, gastosFijos }) {
   );
 }
 
-function FinanzasMovimientos({ transactions, onChange, lists, onListsChange }) {
-  const [form, setForm] = useState({ fecha: new Date().toISOString().slice(0, 10), tipo: 'ingreso', concepto: '', monto: '', medioPago: 'Efectivo', categoria: '', notas: '' });
+function computeAmortizacion(credito) {
+  const P = Number(credito.montoTotal) || 0;
+  const tasaAnual = Number(credito.tasaInteres) || 0;
+  const meses = (credito.plazoUnidad === 'meses') ? (Number(credito.plazo) || 0) : (Number(credito.plazo) || 0) * 12;
+  const r = (tasaAnual / 100) / 12;
+  let cuota = 0;
+  if (meses > 0) cuota = r > 0 ? (P * r) / (1 - Math.pow(1 + r, -meses)) : P / meses;
+  const totalAPagar = cuota * meses;
+  const interesTotal = Math.max(0, totalAPagar - P);
+  const pctMensual = P > 0 ? (cuota / P) * 100 : 0;
+  return { meses, cuota, totalAPagar, interesTotal, pctMensual };
+}
+function creditoAbonado(credito, transactions) {
+  return (transactions || [])
+    .filter(t => t.tipo === 'egreso' && t.categoria === 'Abono a crédito' && t.creditoId === credito.id)
+    .reduce((s, t) => s + (Number(t.monto) || 0), 0);
+}
+
+function FinanzasCreditos({ creditos, onChange, transactions, onTransactionsChange, lists }) {
+  const hoy = new Date().toISOString().slice(0, 10);
+  const [form, setForm] = useState({ nombre: '', montoTotal: '', tasaInteres: '', plazo: '', plazoUnidad: 'años', notas: '' });
+  const [abonoForm, setAbonoForm] = useState(null); // { creditoId, monto, medioPago, fecha }
+  const cuentas = (lists?.cuentas && lists.cuentas.length) ? lists.cuentas : ['Efectivo'];
+  const preview = computeAmortizacion(form);
+
+  function addCredito() {
+    if (!form.nombre.trim() || !(Number(form.montoTotal) > 0)) return;
+    onChange([...(creditos || []), {
+      id: uid(), nombre: form.nombre.trim(),
+      montoTotal: Number(form.montoTotal) || 0,
+      tasaInteres: Number(form.tasaInteres) || 0,
+      plazo: Number(form.plazo) || 0,
+      plazoUnidad: form.plazoUnidad,
+      notas: form.notas, createdAt: new Date().toISOString(),
+    }]);
+    setForm({ nombre: '', montoTotal: '', tasaInteres: '', plazo: '', plazoUnidad: 'años', notas: '' });
+  }
+  function removeCredito(id) { onChange((creditos || []).filter(c => c.id !== id)); }
+
+  function confirmAbono(credito) {
+    const monto = Number(abonoForm.monto) || 0;
+    if (monto <= 0) return;
+    onTransactionsChange([...(transactions || []), {
+      id: uid(), tipo: 'egreso', concepto: `Abono a ${credito.nombre}`, monto,
+      fecha: abonoForm.fecha, medioPago: abonoForm.medioPago,
+      categoria: 'Abono a crédito', creditoId: credito.id, notas: '',
+    }]);
+    setAbonoForm(null);
+  }
+
+  return (
+    <div className="pb-6">
+      <p className="text-sm px-1 mb-3" style={{ color: C.inkSoft }}>Registra créditos o cuentas por pagar (por ejemplo un préstamo o una máquina a cuotas) y mira cuánto vas abonando.</p>
+
+      <SectionTitle>Nueva cuenta por pagar</SectionTitle>
+      <div className="rounded-2xl p-4 mb-5" style={{ background: C.paper, border: `1px solid ${C.line}` }}>
+        <Field label="Nombre"><TextInput placeholder="Ej. Préstamo máquina de coser" value={form.nombre} onChange={e => setForm({ ...form, nombre: e.target.value })} /></Field>
+        <div className="grid grid-cols-2 gap-3">
+          <Field label="Deuda total"><TextInput type="number" inputMode="numeric" placeholder="0" value={form.montoTotal} onChange={e => setForm({ ...form, montoTotal: e.target.value })} /></Field>
+          <Field label="Interés anual (%)"><TextInput type="number" inputMode="numeric" placeholder="0" value={form.tasaInteres} onChange={e => setForm({ ...form, tasaInteres: e.target.value })} /></Field>
+        </div>
+        <div className="grid grid-cols-2 gap-3">
+          <Field label="Plazo"><TextInput type="number" inputMode="numeric" placeholder="0" value={form.plazo} onChange={e => setForm({ ...form, plazo: e.target.value })} /></Field>
+          <Field label="Unidad">
+            <div className="flex gap-2">
+              <button onClick={() => setForm({ ...form, plazoUnidad: 'años' })} className="flex-1 rounded-xl py-2 text-sm font-medium" style={{ background: form.plazoUnidad === 'años' ? C.wine : C.line, color: form.plazoUnidad === 'años' ? '#fff' : C.ink }}>Años</button>
+              <button onClick={() => setForm({ ...form, plazoUnidad: 'meses' })} className="flex-1 rounded-xl py-2 text-sm font-medium" style={{ background: form.plazoUnidad === 'meses' ? C.wine : C.line, color: form.plazoUnidad === 'meses' ? '#fff' : C.ink }}>Meses</button>
+            </div>
+          </Field>
+        </div>
+
+        {Number(form.montoTotal) > 0 && Number(form.plazo) > 0 && (
+          <div className="rounded-xl p-3 my-3" style={{ background: C.cream }}>
+            <p className="text-xs font-medium mb-1.5" style={{ color: C.inkSoft }}>Calculadora — así te quedaría</p>
+            <div className="flex justify-between text-sm mb-0.5"><span style={{ color: C.inkSoft }}>Cuota mensual aprox.</span><span className="font-semibold" style={{ color: C.ink }}>{fmtCOP(preview.cuota)}</span></div>
+            <div className="flex justify-between text-sm mb-0.5"><span style={{ color: C.inkSoft }}>Esa cuota es</span><span style={{ color: C.ink }}>~{preview.pctMensual.toFixed(1)}% de la deuda cada mes</span></div>
+            <div className="flex justify-between text-sm mb-0.5"><span style={{ color: C.inkSoft }}>Total a pagar ({preview.meses} meses)</span><span style={{ color: C.ink }}>{fmtCOP(preview.totalAPagar)}</span></div>
+            <div className="flex justify-between text-sm"><span style={{ color: C.inkSoft }}>Interés total</span><span style={{ color: C.brick }}>{fmtCOP(preview.interesTotal)}</span></div>
+          </div>
+        )}
+
+        <Field label="Notas"><TextInput placeholder="Opcional" value={form.notas} onChange={e => setForm({ ...form, notas: e.target.value })} /></Field>
+        <PrimaryButton full onClick={addCredito}>Agregar cuenta por pagar</PrimaryButton>
+      </div>
+
+      <SectionTitle>Tus cuentas por pagar</SectionTitle>
+      {(!creditos || creditos.length === 0)
+        ? <p className="text-sm px-1" style={{ color: C.inkSoft }}>Aún no tienes créditos ni cuentas por pagar registradas.</p>
+        : creditos.map(credito => {
+          const am = computeAmortizacion(credito);
+          const abonado = creditoAbonado(credito, transactions);
+          const saldo = Math.max(0, (Number(credito.montoTotal) || 0) - abonado);
+          const pct = credito.montoTotal ? Math.min(100, Math.round((abonado / Number(credito.montoTotal)) * 100)) : 0;
+          const pagado = saldo <= 0 && abonado > 0;
+          const editandoAbono = abonoForm?.creditoId === credito.id;
+          return (
+            <div key={credito.id} className="rounded-2xl p-3.5 mb-3" style={{ background: C.paper, border: `1px solid ${C.line}` }}>
+              <div className="flex items-center justify-between mb-1">
+                <p className="font-medium" style={{ color: C.ink }}>{credito.nombre}</p>
+                <button onClick={() => removeCredito(credito.id)} className="w-7 h-7 rounded-full flex items-center justify-center flex-shrink-0" style={{ background: C.line }}><X size={13} /></button>
+              </div>
+              <p className="text-xs mb-2" style={{ color: C.inkSoft }}>{credito.tasaInteres}% anual · {credito.plazo} {credito.plazoUnidad} · cuota aprox. {fmtCOP(am.cuota)}/mes (~{am.pctMensual.toFixed(1)}%)</p>
+              <div className="h-2 rounded-full overflow-hidden mb-1" style={{ background: C.line }}>
+                <div className="h-full rounded-full" style={{ width: `${pct}%`, background: pagado ? C.sage : C.wine }} />
+              </div>
+              <div className="flex items-center justify-between text-xs mb-1">
+                <span style={{ color: C.inkSoft }}>{fmtCOP(abonado)} abonados de {fmtCOP(credito.montoTotal)}</span>
+                <span className="font-semibold" style={{ color: pagado ? C.sage : C.wine }}>{pct}%</span>
+              </div>
+              <div className="flex justify-between text-xs mb-2">
+                <span style={{ color: C.inkSoft }}>Saldo pendiente</span>
+                <span className="font-semibold" style={{ color: saldo > 0 ? C.brick : C.sage }}>{fmtCOP(saldo)}</span>
+              </div>
+
+              {pagado ? (
+                <p className="text-xs text-center font-medium" style={{ color: C.sage }}>Cuenta saldada 🎉</p>
+              ) : editandoAbono ? (
+                <div className="pt-2 space-y-2" style={{ borderTop: `1px solid ${C.line}` }}>
+                  <div className="grid grid-cols-2 gap-2">
+                    <TextInput type="number" inputMode="numeric" placeholder="Monto" value={abonoForm.monto} onChange={e => setAbonoForm({ ...abonoForm, monto: e.target.value })} />
+                    <Select value={abonoForm.medioPago} onChange={e => setAbonoForm({ ...abonoForm, medioPago: e.target.value })}>
+                      {cuentas.map(c => <option key={c}>{c}</option>)}
+                    </Select>
+                  </div>
+                  <TextInput type="date" value={abonoForm.fecha} onChange={e => setAbonoForm({ ...abonoForm, fecha: e.target.value })} />
+                  <div className="flex gap-2">
+                    <GhostButton full onClick={() => setAbonoForm(null)}>Cancelar</GhostButton>
+                    <PrimaryButton full onClick={() => confirmAbono(credito)}>Guardar abono</PrimaryButton>
+                  </div>
+                </div>
+              ) : (
+                <button onClick={() => setAbonoForm({ creditoId: credito.id, monto: '', medioPago: cuentas[0], fecha: hoy })} className="w-full rounded-lg py-2 text-xs font-semibold" style={{ background: C.line, color: C.wine }}>+ Agregar abono</button>
+              )}
+            </div>
+          );
+        })}
+    </div>
+  );
+}
+
+function FinanzasMovimientos({ transactions, onChange, lists, onListsChange, gastosFijos, creditos, orders, clients }) {
+  const [form, setForm] = useState({ fecha: new Date().toISOString().slice(0, 10), tipo: 'ingreso', concepto: '', monto: '', medioPago: 'Efectivo', categoria: '', gastoFijoId: '', creditoId: '', pedidoId: '', factura: '', notas: '' });
   const [addingCuenta, setAddingCuenta] = useState(false);
   const [nuevaCuenta, setNuevaCuenta] = useState('');
   const cuentas = (lists.cuentas && lists.cuentas.length) ? lists.cuentas : ['Efectivo'];
+  const fileRef = useRef(null);
 
+  async function handleFactura(e) {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    try { const dataUrl = await resizeImage(file, 480); setForm(prev => ({ ...prev, factura: dataUrl })); } catch { /* ignore */ }
+  }
   function addCuenta() {
     const v = nuevaCuenta.trim();
     if (!v) return;
@@ -2146,9 +2542,13 @@ function FinanzasMovimientos({ transactions, onChange, lists, onListsChange }) {
   function addTx() {
     if (!form.concepto.trim() || !form.monto) return;
     onChange([...transactions, { id: uid(), ...form, monto: Number(form.monto) || 0 }]);
-    setForm({ fecha: new Date().toISOString().slice(0, 10), tipo: 'ingreso', concepto: '', monto: '', medioPago: form.medioPago, categoria: '', notas: '' });
+    setForm({ fecha: new Date().toISOString().slice(0, 10), tipo: 'ingreso', concepto: '', monto: '', medioPago: form.medioPago, categoria: '', gastoFijoId: '', creditoId: '', pedidoId: '', factura: '', notas: '' });
   }
   function removeTx(id) { onChange(transactions.filter(t => t.id !== id)); }
+  function nombrePedido(o) {
+    const cli = (clients || []).find(c => c.id === o.clientId);
+    return `${o.prenda || 'Pedido'}${cli ? ' — ' + cli.nombre : ''}`;
+  }
 
   const sorted = transactions.slice().sort((a, b) => (b.fecha || '').localeCompare(a.fecha || ''));
   const totalIngresos = transactions.filter(t => t.tipo === 'ingreso').reduce((s, t) => s + (Number(t.monto) || 0), 0);
@@ -2192,14 +2592,64 @@ function FinanzasMovimientos({ transactions, onChange, lists, onListsChange }) {
         </Field>
 
         {form.tipo === 'egreso' && (
-          <Field label="Tipo de gasto">
-            <Select value={form.categoria} onChange={e => setForm({ ...form, categoria: e.target.value })}>
-              <option value="">Selecciona…</option>
-              <option>Gasto fijo</option>
-              <option>Gasto de personal</option>
-              <option>Gasto de empresa</option>
-            </Select>
-          </Field>
+          <>
+            <Field label="Tipo de gasto">
+              <Select value={form.categoria} onChange={e => setForm({ ...form, categoria: e.target.value, gastoFijoId: '', creditoId: '', pedidoId: '' })}>
+                <option value="">Selecciona…</option>
+                <option>Gasto fijo</option>
+                <option>Gasto de personal</option>
+                <option>Gasto de empresa</option>
+                <option>Costo de pedido</option>
+                <option>Abono a crédito</option>
+              </Select>
+            </Field>
+
+            {form.categoria === 'Gasto fijo' && (
+              <Field label="¿Cuál gasto fijo?">
+                <Select value={form.gastoFijoId} onChange={e => {
+                  const g = (gastosFijos || []).find(x => x.id === e.target.value);
+                  setForm({ ...form, gastoFijoId: e.target.value, concepto: g ? g.nombre : form.concepto });
+                }}>
+                  <option value="">Selecciona…</option>
+                  {(gastosFijos || []).map(g => <option key={g.id} value={g.id}>{g.nombre}</option>)}
+                </Select>
+                {(!gastosFijos || gastosFijos.length === 0) && <p className="text-xs mt-1" style={{ color: C.inkSoft }}>Aún no tienes gastos fijos registrados — créalos en la pestaña "Gastos fijos".</p>}
+              </Field>
+            )}
+
+            {form.categoria === 'Costo de pedido' && (
+              <Field label="¿De cuál pedido?">
+                <Select value={form.pedidoId} onChange={e => {
+                  const o = (orders || []).find(x => x.id === e.target.value);
+                  setForm({ ...form, pedidoId: e.target.value, concepto: o ? `Costo — ${nombrePedido(o)}` : form.concepto });
+                }}>
+                  <option value="">Selecciona…</option>
+                  {(orders || []).slice().sort((a, b) => (b.createdAt || '').localeCompare(a.createdAt || '')).map(o => <option key={o.id} value={o.id}>{nombrePedido(o)}</option>)}
+                </Select>
+              </Field>
+            )}
+
+            {form.categoria === 'Abono a crédito' && (
+              <Field label="¿A cuál cuenta por pagar?">
+                <Select value={form.creditoId} onChange={e => {
+                  const c = (creditos || []).find(x => x.id === e.target.value);
+                  setForm({ ...form, creditoId: e.target.value, concepto: c ? `Abono a ${c.nombre}` : form.concepto });
+                }}>
+                  <option value="">Selecciona…</option>
+                  {(creditos || []).map(c => <option key={c.id} value={c.id}>{c.nombre}</option>)}
+                </Select>
+                {(!creditos || creditos.length === 0) && <p className="text-xs mt-1" style={{ color: C.inkSoft }}>Aún no tienes cuentas por pagar — créalas en la pestaña "Cuentas por pagar".</p>}
+              </Field>
+            )}
+
+            <Field label="Factura (opcional)">
+              <input ref={fileRef} type="file" accept="image/*" onChange={handleFactura} className="hidden" />
+              <button onClick={() => fileRef.current?.click()} className="w-full rounded-xl py-3 flex items-center justify-center gap-2 border" style={{ borderColor: C.line, borderStyle: 'dashed' }}>
+                {form.factura ? <img src={form.factura} className="w-10 h-10 rounded-lg object-cover" /> : <Camera size={18} style={{ color: C.inkSoft }} />}
+                <span className="text-sm" style={{ color: C.inkSoft }}>{form.factura ? 'Cambiar foto' : 'Agregar foto de la factura'}</span>
+              </button>
+            </Field>
+          </>
         )}
 
         <Field label="Notas"><TextInput placeholder="Opcional" value={form.notas} onChange={e => setForm({ ...form, notas: e.target.value })} /></Field>
@@ -2211,6 +2661,7 @@ function FinanzasMovimientos({ transactions, onChange, lists, onListsChange }) {
         ? <p className="text-sm px-1" style={{ color: C.inkSoft }}>Sin movimientos registrados.</p>
         : sorted.map(t => (
           <div key={t.id} className="rounded-2xl p-3.5 mb-2.5 flex items-center gap-3" style={{ background: C.paper, border: `1px solid ${C.line}` }}>
+            {t.factura && <img src={t.factura} className="w-10 h-10 rounded-lg object-cover flex-shrink-0" />}
             <div className="flex-1 min-w-0">
               <p className="font-medium truncate" style={{ color: C.ink }}>{t.concepto}</p>
               <p className="text-xs truncate" style={{ color: C.inkSoft }}>{fmtDate(t.fecha)} · {t.medioPago || 'Efectivo'}{t.categoria ? ` · ${t.categoria}` : ''}{t.notas ? ` · ${t.notas}` : ''}</p>
@@ -2397,61 +2848,110 @@ function FinanzasHoy({ orders, transactions }) {
   );
 }
 
-function FinanzasAhorros({ ahorros, onChange }) {
-  const [form, setForm] = useState({ fecha: new Date().toISOString().slice(0, 10), tipo: 'deposito', monto: '', nota: '' });
+function FinanzasAhorros({ ahorros, onChange, lists, onListsChange }) {
+  const hoy = () => new Date().toISOString().slice(0, 10);
+  const [abierto, setAbierto] = useState(null); // nombre del ahorro abierto
+  const [nuevoNombre, setNuevoNombre] = useState('');
+  const [form, setForm] = useState({ fecha: hoy(), tipo: 'deposito', monto: '', nota: '' });
 
-  function addMov() {
+  const GENERAL = 'General';
+  const nombreDe = a => a.bolsillo || GENERAL;
+  const hayGeneral = ahorros.some(a => !a.bolsillo);
+  const creados = lists.bolsillos || [];
+  const nombres = [...(hayGeneral && !creados.includes(GENERAL) ? [GENERAL] : []), ...creados];
+  const signo = a => (a.tipo === 'deposito' ? 1 : -1) * (Number(a.monto) || 0);
+  const saldoDe = n => ahorros.filter(a => nombreDe(a) === n).reduce((s, a) => s + signo(a), 0);
+  const total = ahorros.reduce((s, a) => s + signo(a), 0);
+
+  function addBolsillo() {
+    const v = nuevoNombre.trim();
+    if (!v || nombres.includes(v)) return;
+    onListsChange({ ...lists, bolsillos: [...creados, v] });
+    setNuevoNombre('');
+    setAbierto(v);
+  }
+  function removeBolsillo(n) {
+    if (ahorros.some(a => nombreDe(a) === n)) return;
+    onListsChange({ ...lists, bolsillos: creados.filter(x => x !== n) });
+    setAbierto(null);
+  }
+  function addMov(n) {
     if (!form.monto) return;
-    onChange([...ahorros, { id: uid(), ...form, monto: Number(form.monto) || 0 }]);
-    setForm({ fecha: new Date().toISOString().slice(0, 10), tipo: 'deposito', monto: '', nota: '' });
+    onChange([...ahorros, { id: uid(), ...form, bolsillo: n === GENERAL ? '' : n, monto: Number(form.monto) || 0 }]);
+    setForm({ fecha: hoy(), tipo: 'deposito', monto: '', nota: '' });
   }
   function removeMov(id) { onChange(ahorros.filter(a => a.id !== id)); }
-
-  const total = ahorros.reduce((s, a) => s + (a.tipo === 'deposito' ? (Number(a.monto) || 0) : -(Number(a.monto) || 0)), 0);
-  const sorted = ahorros.slice().sort((a, b) => (b.fecha || '').localeCompare(a.fecha || ''));
 
   return (
     <div className="pb-6">
       <StatCard label="Total en ahorros" value={fmtCOP(total)} accent={C.sage} />
 
-      <SectionTitle>Nuevo movimiento de ahorro</SectionTitle>
-      <div className="rounded-2xl p-4 mb-5" style={{ background: C.paper, border: `1px solid ${C.line}` }}>
-        <div className="flex gap-2 mb-3">
-          <button onClick={() => setForm({ ...form, tipo: 'deposito' })} className="flex-1 rounded-xl py-2 text-sm font-medium" style={{ background: form.tipo === 'deposito' ? C.sage : C.line, color: form.tipo === 'deposito' ? '#fff' : C.ink }}>Depósito</button>
-          <button onClick={() => setForm({ ...form, tipo: 'retiro' })} className="flex-1 rounded-xl py-2 text-sm font-medium" style={{ background: form.tipo === 'retiro' ? C.brick : C.line, color: form.tipo === 'retiro' ? '#fff' : C.ink }}>Retiro</button>
-        </div>
-        <div className="grid grid-cols-2 gap-3">
-          <Field label="Monto"><TextInput type="number" value={form.monto} onChange={e => setForm({ ...form, monto: e.target.value })} /></Field>
-          <Field label="Fecha"><TextInput type="date" value={form.fecha} onChange={e => setForm({ ...form, fecha: e.target.value })} /></Field>
-        </div>
-        <Field label="Nota"><TextInput placeholder="Opcional" value={form.nota} onChange={e => setForm({ ...form, nota: e.target.value })} /></Field>
-        <PrimaryButton full onClick={addMov}>Agregar</PrimaryButton>
-      </div>
+      <SectionTitle>Mis ahorros</SectionTitle>
+      {nombres.length === 0 && <p className="text-sm px-1 mb-3" style={{ color: C.inkSoft }}>Aún no tienes ahorros. Crea el primero abajo (ej. “Máquina de coser”, “Fondo de emergencia”).</p>}
+      {nombres.map(n => {
+        const open = abierto === n;
+        const movs = ahorros.filter(a => nombreDe(a) === n).sort((x, y) => (y.fecha || '').localeCompare(x.fecha || ''));
+        const saldo = saldoDe(n);
+        return (
+          <div key={n} className="rounded-2xl mb-2.5 overflow-hidden" style={{ background: C.paper, border: `1px solid ${C.line}` }}>
+            <button onClick={() => { setAbierto(open ? null : n); setForm({ fecha: hoy(), tipo: 'deposito', monto: '', nota: '' }); }} className="w-full flex items-center gap-3 p-3.5 text-left">
+              <div className="flex-1 min-w-0">
+                <p className="font-medium truncate" style={{ color: C.ink }}>{n}</p>
+                <p className="text-xs" style={{ color: C.inkSoft }}>{movs.length} movimiento{movs.length !== 1 ? 's' : ''}</p>
+              </div>
+              <p className="font-semibold flex-shrink-0" style={{ color: saldo >= 0 ? C.sage : C.brick }}>{fmtCOP(saldo)}</p>
+              <ChevronRight size={18} style={{ color: C.inkSoft, transform: open ? 'rotate(90deg)' : 'none', flexShrink: 0 }} />
+            </button>
+            {open && (
+              <div className="px-3.5 pb-3.5" style={{ borderTop: `1px solid ${C.line}` }}>
+                <div className="flex gap-2 my-3">
+                  <button onClick={() => setForm({ ...form, tipo: 'deposito' })} className="flex-1 rounded-xl py-2 text-sm font-medium" style={{ background: form.tipo === 'deposito' ? C.sage : C.line, color: form.tipo === 'deposito' ? '#fff' : C.ink }}>Guardar</button>
+                  <button onClick={() => setForm({ ...form, tipo: 'retiro' })} className="flex-1 rounded-xl py-2 text-sm font-medium" style={{ background: form.tipo === 'retiro' ? C.brick : C.line, color: form.tipo === 'retiro' ? '#fff' : C.ink }}>Retirar</button>
+                </div>
+                <div className="grid grid-cols-2 gap-3">
+                  <Field label="Monto"><TextInput type="number" inputMode="numeric" value={form.monto} onChange={e => setForm({ ...form, monto: e.target.value })} /></Field>
+                  <Field label="Fecha"><TextInput type="date" value={form.fecha} onChange={e => setForm({ ...form, fecha: e.target.value })} /></Field>
+                </div>
+                <Field label="Nota"><TextInput placeholder="Opcional" value={form.nota} onChange={e => setForm({ ...form, nota: e.target.value })} /></Field>
+                <PrimaryButton full onClick={() => addMov(n)}>{form.tipo === 'deposito' ? `Guardar en ${n}` : `Retirar de ${n}`}</PrimaryButton>
 
-      <SectionTitle>Historial de ahorros</SectionTitle>
-      {sorted.length === 0
-        ? <p className="text-sm px-1" style={{ color: C.inkSoft }}>Aún no has registrado ahorros.</p>
-        : sorted.map(a => (
-          <div key={a.id} className="rounded-2xl p-3.5 mb-2.5 flex items-center gap-3" style={{ background: C.paper, border: `1px solid ${C.line}` }}>
-            <div className="flex-1 min-w-0">
-              <p className="font-medium truncate" style={{ color: C.ink }}>{a.tipo === 'deposito' ? 'Depósito' : 'Retiro'}{a.nota ? ` · ${a.nota}` : ''}</p>
-              <p className="text-xs" style={{ color: C.inkSoft }}>{fmtDate(a.fecha)}</p>
-            </div>
-            <p className="font-semibold flex-shrink-0" style={{ color: a.tipo === 'deposito' ? C.sage : C.brick }}>{a.tipo === 'deposito' ? '+' : '-'}{fmtCOP(a.monto)}</p>
-            <button onClick={() => removeMov(a.id)} className="w-7 h-7 rounded-full flex items-center justify-center flex-shrink-0" style={{ background: C.line }}><X size={13} /></button>
+                {movs.length > 0 && <p className="text-[11px] uppercase tracking-wider mt-4 mb-2" style={{ color: C.inkSoft }}>Historial</p>}
+                {movs.map(a => (
+                  <div key={a.id} className="flex items-center gap-3 py-1.5">
+                    <div className="flex-1 min-w-0">
+                      <p className="text-sm truncate" style={{ color: C.ink }}>{a.tipo === 'deposito' ? 'Guardado' : 'Retiro'}{a.nota ? ` · ${a.nota}` : ''}</p>
+                      <p className="text-xs" style={{ color: C.inkSoft }}>{fmtDate(a.fecha)}</p>
+                    </div>
+                    <p className="text-sm font-semibold flex-shrink-0" style={{ color: a.tipo === 'deposito' ? C.sage : C.brick }}>{a.tipo === 'deposito' ? '+' : '-'}{fmtCOP(a.monto)}</p>
+                    <button onClick={() => removeMov(a.id)} className="w-7 h-7 rounded-full flex items-center justify-center flex-shrink-0" style={{ background: C.line }}><X size={13} /></button>
+                  </div>
+                ))}
+                {movs.length === 0 && n !== GENERAL && (
+                  <button onClick={() => removeBolsillo(n)} className="text-xs font-medium mt-3 flex items-center gap-1" style={{ color: C.brick }}><Trash2 size={13} /> Eliminar este ahorro</button>
+                )}
+              </div>
+            )}
           </div>
-        ))}
+        );
+      })}
+
+      <SectionTitle>Nuevo ahorro</SectionTitle>
+      <div className="flex gap-2">
+        <div className="flex-1"><TextInput placeholder="Nombre del ahorro" value={nuevoNombre} onChange={e => setNuevoNombre(e.target.value)} onKeyDown={e => e.key === 'Enter' && addBolsillo()} /></div>
+        <button onClick={addBolsillo} className="rounded-xl px-4 font-medium text-sm flex-shrink-0" style={{ background: C.wine, color: '#fff' }}>Crear</button>
+      </div>
     </div>
   );
 }
 
-function Finanzas({ orders, clients, transactions, onTransactionsChange, gastosFijos, onGastosFijosChange, onOpenOrder, lists, onListsChange, ahorros, onAhorrosChange }) {
+function Finanzas({ orders, clients, transactions, onTransactionsChange, gastosFijos, onGastosFijosChange, creditos, onCreditosChange, onOpenOrder, lists, onListsChange, ahorros, onAhorrosChange }) {
   const [sub, setSub] = useState('resumen');
   const tabs = [
     { key: 'resumen', label: 'Resumen' },
     { key: 'mes', label: 'Resumen del mes' },
     { key: 'movimientos', label: 'Ingresos/Egresos' },
     { key: 'fijos', label: 'Gastos fijos' },
+    { key: 'creditos', label: 'Cuentas por pagar' },
     { key: 'ahorros', label: 'Ahorros' },
     { key: 'cartera', label: 'Cartera' },
     { key: 'dia', label: 'Hoy' },
@@ -2468,9 +2968,10 @@ function Finanzas({ orders, clients, transactions, onTransactionsChange, gastosF
       </div>
       {sub === 'resumen' && <FinanzasResumen orders={orders} gastosFijos={gastosFijos} transactions={transactions} />}
       {sub === 'mes' && <FinanzasResumenMensual orders={orders} transactions={transactions} gastosFijos={gastosFijos} />}
-      {sub === 'movimientos' && <FinanzasMovimientos transactions={transactions} onChange={onTransactionsChange} lists={lists} onListsChange={onListsChange} />}
+      {sub === 'movimientos' && <FinanzasMovimientos transactions={transactions} onChange={onTransactionsChange} lists={lists} onListsChange={onListsChange} gastosFijos={gastosFijos} creditos={creditos} orders={orders} clients={clients} />}
       {sub === 'fijos' && <FinanzasGastosFijos gastosFijos={gastosFijos} onChange={onGastosFijosChange} lists={lists} onListsChange={onListsChange} />}
-      {sub === 'ahorros' && <FinanzasAhorros ahorros={ahorros} onChange={onAhorrosChange} />}
+      {sub === 'creditos' && <FinanzasCreditos creditos={creditos} onChange={onCreditosChange} transactions={transactions} onTransactionsChange={onTransactionsChange} lists={lists} />}
+      {sub === 'ahorros' && <FinanzasAhorros ahorros={ahorros} onChange={onAhorrosChange} lists={lists} onListsChange={onListsChange} />}
       {sub === 'cartera' && <FinanzasCartera orders={orders} clients={clients} onOpenOrder={onOpenOrder} filtro="todos" />}
       {sub === 'dia' && <FinanzasHoy orders={orders} transactions={transactions} />}
       {sub === 'morosos' && <FinanzasCartera orders={orders} clients={clients} onOpenOrder={onOpenOrder} filtro="morosos" />}
@@ -2481,15 +2982,14 @@ function Finanzas({ orders, clients, transactions, onTransactionsChange, gastosF
 /* ------------------------------------------------------------------ */
 /*  Candado de contraseña adicional (Finanzas y Listas)                 */
 /* ------------------------------------------------------------------ */
-function PasswordGate({ password, title, children }) {
-  const [unlocked, setUnlocked] = useState(false);
+function PasswordGate({ password, title, children, unlocked, onUnlock }) {
   const [pw, setPw] = useState('');
   const [err, setErr] = useState('');
 
   if (unlocked) return children;
 
   function tryUnlock() {
-    if (pw === password) { setUnlocked(true); setErr(''); }
+    if (pw === password) { onUnlock(); setErr(''); }
     else setErr('Contraseña incorrecta');
   }
 
@@ -2776,7 +3276,7 @@ function Mas({ sub, setSub, ...rest }) {
       {sub === 'inspiracion' && <Inspiracion fotos={rest.inspiracionFotos} onFotosChange={rest.onInspiracionFotosChange} tableros={rest.pinterestTableros} onTablerosChange={rest.onPinterestTablerosChange} />}
       {sub === 'medidas' && <Medidas clients={rest.clients} onSaveMedidas={rest.onSaveMedidas} />}
       {sub === 'finanzas' && (
-        <PasswordGate password={rest.passwordAvanzada} title="Finanzas">
+        <PasswordGate password={rest.passwordAvanzada} title="Finanzas" unlocked={rest.advancedUnlocked} onUnlock={rest.onAdvancedUnlock}>
           <Finanzas
             orders={rest.orders}
             clients={rest.clients}
@@ -2784,6 +3284,8 @@ function Mas({ sub, setSub, ...rest }) {
             onTransactionsChange={rest.onTransactionsChange}
             gastosFijos={rest.gastosFijos}
             onGastosFijosChange={rest.onGastosFijosChange}
+            creditos={rest.creditos}
+            onCreditosChange={rest.onCreditosChange}
             onOpenOrder={rest.onOpenOrder}
             lists={rest.lists}
             onListsChange={rest.onListsChange}
@@ -2793,7 +3295,7 @@ function Mas({ sub, setSub, ...rest }) {
         </PasswordGate>
       )}
       {sub === 'listas' && (
-        <PasswordGate password={rest.passwordAvanzada} title="Listas y desplegables">
+        <PasswordGate password={rest.passwordAvanzada} title="Listas y desplegables" unlocked={rest.advancedUnlocked} onUnlock={rest.onAdvancedUnlock}>
           <Listas lists={rest.lists} onChange={rest.onListsChange} onChangePassword={rest.onChangePassword} onChangePasswordAvanzada={rest.onChangePasswordAvanzada} />
         </PasswordGate>
       )}
@@ -3019,6 +3521,7 @@ export default function App() {
   const [goals, setGoals] = useState([]);
   const [transactions, setTransactions] = useState([]);
   const [gastosFijos, setGastosFijos] = useState([]);
+  const [creditos, setCreditos] = useState([]);
   const [ahorros, setAhorros] = useState([]);
   const [telasCatalogo, setTelasCatalogo] = useState([]);
   const [inspiracionFotos, setInspiracionFotos] = useState([]);
@@ -3038,12 +3541,13 @@ export default function App() {
   const [authPassword, setAuthPassword] = useState('kawa2026');
   const [advancedPassword, setAdvancedPassword] = useState('kawa2026fin');
   const [authed, setAuthed] = useState(false);
+  const [advancedUnlocked, setAdvancedUnlocked] = useState(false); // se pide una sola vez por sesión
   const [authError, setAuthError] = useState('');
 
   useEffect(() => {
     (async () => {
       try {
-        const [o, c, l, auth, qt, cat, gl, tx, gf, ah, tc, ifo, pin] = await Promise.all([
+        const [o, c, l, auth, qt, cat, gl, tx, gf, ah, tc, ifo, pin, cr] = await Promise.all([
           window.storage.get('kawa-orders', true).catch(() => null),
           window.storage.get('kawa-clients', true).catch(() => null),
           window.storage.get('kawa-lists', true).catch(() => null),
@@ -3057,6 +3561,7 @@ export default function App() {
           window.storage.get('kawa-telascatalogo', true).catch(() => null),
           window.storage.get('kawa-inspiracion', true).catch(() => null),
           window.storage.get('kawa-pinterest', true).catch(() => null),
+          window.storage.get('kawa-creditos', true).catch(() => null),
         ]);
         if (o?.value) setOrders(JSON.parse(o.value));
         if (c?.value) setClients(JSON.parse(c.value));
@@ -3074,6 +3579,7 @@ export default function App() {
         if (tc?.value) setTelasCatalogo(JSON.parse(tc.value));
         if (ifo?.value) setInspiracionFotos(JSON.parse(ifo.value));
         if (pin?.value) setPinterestTableros(JSON.parse(pin.value));
+        if (cr?.value) setCreditos(JSON.parse(cr.value));
         if (auth?.value) {
           const parsedAuth = JSON.parse(auth.value);
           setAuthPassword(parsedAuth.password || 'kawa2026');
@@ -3110,6 +3616,7 @@ export default function App() {
   function saveGoals(next) { setGoals(next); persist('kawa-goals', next); }
   function saveTransactions(next) { setTransactions(next); persist('kawa-transactions', next); }
   function saveGastosFijos(next) { setGastosFijos(next); persist('kawa-gastosfijos', next); }
+  function saveCreditos(next) { setCreditos(next); persist('kawa-creditos', next); }
   function saveAhorros(next) { setAhorros(next); persist('kawa-ahorros', next); }
   function saveTelasCatalogo(next) { setTelasCatalogo(next); persist('kawa-telascatalogo', next); }
   function saveInspiracionFotos(next) { setInspiracionFotos(next); persist('kawa-inspiracion', next); }
@@ -3163,6 +3670,11 @@ export default function App() {
     const updated = { ...order, etapa };
     saveOrders(orders.map(o => o.id === order.id ? updated : o));
     setOrderDetail(updated);
+  }
+  function handleSaveCostos(order, costos) {
+    const updated = { ...order, costos };
+    saveOrders(orders.map(o => o.id === order.id ? updated : o));
+    setOrderDetail(prev => (prev && prev.id === order.id) ? updated : prev);
   }
   function handleAddAbono(order, monto, medioPago, fecha) {
     const montoNum = Number(monto) || 0;
@@ -3219,9 +3731,15 @@ export default function App() {
     if (!client) client = createClient({ nombre: q.clienteNombre, telefono: '', instagram: '' });
     let workingOrders = orders;
     const created = [];
+    const clone = o => JSON.parse(JSON.stringify(o));
     q.prendas.forEach(p => {
       const totals = computePrendaTotals(p);
       const primerTela = p.itemsConUnidad.find(i => i.categoria === 'Tela' && i.nombre);
+      // Copia completa de la prenda con costos reales en blanco (incluye márgenes, comisión, envío…)
+      const costos = clone(p);
+      costos.itemsConUnidad = costos.itemsConUnidad.map(it => ({ ...it, valorReal: '', factura: '' }));
+      costos.itemsDirectos = costos.itemsDirectos.map(it => ({ ...it, valorReal: '', factura: '' }));
+      costos.corteReal = ''; costos.corteFactura = ''; costos.ensambleReal = ''; costos.ensambleFactura = ''; costos.envioReal = ''; costos.envioFactura = '';
       const newOrder = {
         id: uid(), codigo: nextCode(workingOrders, 'codigo', 'KAWA'), clientId: client.id,
         tipo: 'Personalizado', coleccionId: '', prendaCatalogoId: '',
@@ -3229,19 +3747,20 @@ export default function App() {
         precio: Math.round(totals.totalPrenda), abono: 0, fechaEntrega: '', etapa: 'Moldería',
         prioridad: 'Media', observaciones: `Generado desde la cotización del ${fmtDate(q.fecha)}.`,
         foto: '', fotos: [], metros: '', cierre: 'No', corteResponsable: '', ensambleResponsable: '',
-        costos: {
-          itemsConUnidad: p.itemsConUnidad.map(it => ({ ...it, valorReal: '', factura: '' })),
-          itemsDirectos: p.itemsDirectos.map(it => ({ ...it, valorReal: '', factura: '' })),
-          corte: p.corte, corteReal: '', corteFactura: '',
-          ensamble: p.ensamble, ensambleReal: '', ensambleFactura: '',
-        },
+        quoteId: q.id,
+        // Foto fija de la cotización tal como estaba al convertirla (no cambia si luego editas la cotización)
+        cotizacion: { fecha: q.fecha, asesor: q.asesor || '', notas: q.notas || '', prenda: clone(p) },
+        costos,
         createdAt: new Date().toISOString(),
       };
       workingOrders = [...workingOrders, newOrder];
       created.push(newOrder);
     });
     saveOrders(workingOrders);
-    saveQuotes(quotes.map(x => x.id === q.id ? { ...x, estado: 'Convertida a pedido', orderIds: created.map(o => o.id) } : x));
+    // La cotización se guarda siempre (con todo lo que tenía en pantalla), exista ya o no.
+    const savedQuote = { ...q, clientId: client.id, clienteNombre: client.nombre, estado: 'Convertida a pedido', orderIds: created.map(o => o.id) };
+    const exists = quotes.some(x => x.id === q.id);
+    saveQuotes(exists ? quotes.map(x => x.id === q.id ? savedQuote : x) : [...quotes, savedQuote]);
     setQuoteModal(null);
     setTab('pedidos');
   }
@@ -3249,7 +3768,7 @@ export default function App() {
   function goTab(t, sub) { setTab(t); if (sub) setMasSub(sub); }
 
   function handleLogin(pw) {
-    if (pw === authPassword) { setAuthed(true); setAuthError(''); }
+    if (pw === authPassword) { setAuthed(true); setAdvancedUnlocked(false); setAuthError(''); }
     else { setAuthError('Contraseña incorrecta'); }
   }
 
@@ -3363,7 +3882,7 @@ export default function App() {
               {tab === 'pedidos' && <Pedidos {...commonProps} onNew={() => setOrderModal({ mode: 'new' })} />}
               {tab === 'produccion' && <Produccion {...commonProps} />}
               {tab === 'clientes' && <Clientes clients={clients} orders={orders} onSelect={setClientDetail} onNew={() => setClientModal({ mode: 'new' })} />}
-              {tab === 'mas' && <Mas sub={masSub} setSub={setMasSub} orders={orders} clients={clients} onOpenOrder={setOrderDetail} lists={lists} onListsChange={saveLists} onChangePassword={changePassword} passwordAvanzada={advancedPassword} onChangePasswordAvanzada={changePasswordAvanzada} quotes={quotes} onOpenQuote={q => setQuoteModal({ mode: 'edit', quote: q })} onNewQuote={() => setQuoteModal({ mode: 'new' })} onSaveMedidas={updateClientMedidas} catalog={catalog} onCatalogChange={saveCatalog} goals={goals} onGoalsChange={saveGoals} transactions={transactions} onTransactionsChange={saveTransactions} gastosFijos={gastosFijos} onGastosFijosChange={saveGastosFijos} ahorros={ahorros} onAhorrosChange={saveAhorros} telasCatalogo={telasCatalogo} onTelasCatalogoChange={saveTelasCatalogo} inspiracionFotos={inspiracionFotos} onInspiracionFotosChange={saveInspiracionFotos} pinterestTableros={pinterestTableros} onPinterestTablerosChange={savePinterestTableros} />}
+              {tab === 'mas' && <Mas sub={masSub} setSub={setMasSub} advancedUnlocked={advancedUnlocked} onAdvancedUnlock={() => setAdvancedUnlocked(true)} orders={orders} clients={clients} onOpenOrder={setOrderDetail} lists={lists} onListsChange={saveLists} onChangePassword={changePassword} passwordAvanzada={advancedPassword} onChangePasswordAvanzada={changePasswordAvanzada} quotes={quotes} onOpenQuote={q => setQuoteModal({ mode: 'edit', quote: q })} onNewQuote={() => setQuoteModal({ mode: 'new' })} onSaveMedidas={updateClientMedidas} catalog={catalog} onCatalogChange={saveCatalog} goals={goals} onGoalsChange={saveGoals} transactions={transactions} onTransactionsChange={saveTransactions} gastosFijos={gastosFijos} onGastosFijosChange={saveGastosFijos} creditos={creditos} onCreditosChange={saveCreditos} ahorros={ahorros} onAhorrosChange={saveAhorros} telasCatalogo={telasCatalogo} onTelasCatalogoChange={saveTelasCatalogo} inspiracionFotos={inspiracionFotos} onInspiracionFotosChange={saveInspiracionFotos} pinterestTableros={pinterestTableros} onPinterestTablerosChange={savePinterestTableros} />}
             </main>
           </div>
         </div>
@@ -3387,6 +3906,8 @@ export default function App() {
             order={orderDetail}
             client={clients.find(c => c.id === orderDetail.clientId)}
             lists={lists}
+            cotizacion={getOrderCotizacion(orderDetail, quotes)}
+            onSaveCostos={costos => handleSaveCostos(orderDetail, costos)}
             onClose={() => setOrderDetail(null)}
             onEdit={() => { setOrderModal({ mode: 'edit', order: orderDetail }); setOrderDetail(null); }}
             onStageChange={etapa => handleStageChange(orderDetail, etapa)}
@@ -3460,9 +3981,10 @@ export default function App() {
       {orderCostsModal && (
         <Sheet title="Costos reales" onClose={() => setOrderCostsModal(null)}>
           <OrderCostsEditor
-            order={orderCostsModal}
+            order={orders.find(o => o.id === orderCostsModal.id) || orderCostsModal}
             onSave={(costos) => {
-              saveOrders(orders.map(o => o.id === orderCostsModal.id ? { ...o, costos } : o));
+              const base = orders.find(o => o.id === orderCostsModal.id) || orderCostsModal;
+              handleSaveCostos(base, costos);
               setOrderCostsModal(null);
             }}
             onClose={() => setOrderCostsModal(null)}
