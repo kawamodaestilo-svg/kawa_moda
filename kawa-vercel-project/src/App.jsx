@@ -244,13 +244,16 @@ function computeQuoteTotals(q) {
 function computeGastoPrenda(c) {
   if (!c) return null;
   const t = computePrendaTotals(c);
-  const presupuesto = t.totalProduccion + (Number(c.envio) || 0);
-  let gastado = 0, count = 0;
+  // La comisión SIEMPRE cuenta como gastado (se haya pagado ya o no), para que
+  // "disponible" refleje lo que en verdad queda una vez se descuenta todo.
+  const comisionValor = t.comisionValor || 0;
+  const presupuesto = t.totalProduccion + (Number(c.envio) || 0) + comisionValor;
+  let gastado = comisionValor, count = 0;
   const add = v => { if (v !== '' && v != null) { gastado += Number(v) || 0; count++; } };
   (c.itemsConUnidad || []).forEach(it => add(it.valorReal));
   (c.itemsDirectos || []).forEach(it => add(it.valorReal));
   add(c.corteReal); add(c.ensambleReal); add(c.envioReal);
-  return { presupuesto, gastado, disponible: presupuesto - gastado, count };
+  return { presupuesto, gastado, disponible: presupuesto - gastado, count, comisionValor };
 }
 // Filas comparativas cotizado vs real (para la pestaña de comparación)
 function buildComparativo(c) {
@@ -767,6 +770,9 @@ function nombreAbono(i) { return ABONO_ORDINALES[i] || `Abono ${i + 1}`; }
 function OrderDetail({ order, client, lists, cotizacion, onEdit, onClose, onStageChange, onOpenCosts, onSaveCostos, onAddAbono, onDeleteAbono }) {
   const [vista, setVista] = useState('resumen');
   const gasto = computeGastoPrenda(order.costos);
+  // Ganancia real: sobre lo que en verdad se gastó (no sobre lo cotizado).
+  const gananciaBrutaReal = gasto ? (Number(order.precio) || 0) - (gasto.gastado - gasto.comisionValor) : 0;
+  const gananciaNetaReal = gasto ? (Number(order.precio) || 0) - gasto.gastado : 0;
   const idx = ETAPA_KEYS.indexOf(order.etapa);
   const saldo = (Number(order.precio) || 0) - (Number(order.abono) || 0);
   const pct = pctPagado(order.precio, order.abono);
@@ -941,8 +947,27 @@ function OrderDetail({ order, client, lists, cotizacion, onEdit, onClose, onStag
         <div className="rounded-xl p-3 mb-4" style={{ background: C.paper, border: `1px solid ${C.line}` }}>
           <p className="text-[11px] uppercase tracking-wider mb-2" style={{ color: C.inkSoft }}>Gastos de la prenda</p>
           <div className="flex justify-between text-sm mb-1"><span style={{ color: C.inkSoft }}>Presupuesto cotizado</span><span style={{ color: C.ink }}>{fmtCOP(gasto.presupuesto)}</span></div>
-          <div className="flex justify-between text-sm mb-1"><span style={{ color: C.inkSoft }}>Gastado (real)</span><span style={{ color: C.ink }}>{fmtCOP(gasto.gastado)}</span></div>
-          <div className="flex justify-between text-sm font-semibold"><span style={{ color: C.ink }}>{gasto.disponible >= 0 ? 'Disponible' : 'Excedido'}</span><span style={{ color: gasto.disponible >= 0 ? C.sage : C.brick }}>{fmtCOP(Math.abs(gasto.disponible))}</span></div>
+          <div className="flex justify-between text-sm mb-1"><span style={{ color: C.inkSoft }}>Gastado (real, incluye comisión)</span><span style={{ color: C.ink }}>{fmtCOP(gasto.gastado)}</span></div>
+          <div className="flex justify-between text-sm font-semibold mb-2"><span style={{ color: C.ink }}>{gasto.disponible >= 0 ? 'Disponible' : 'Excedido'}</span><span style={{ color: gasto.disponible >= 0 ? C.sage : C.brick }}>{fmtCOP(Math.abs(gasto.disponible))}</span></div>
+
+          <div className="pt-2 mt-1" style={{ borderTop: `1px solid ${C.line}` }}>
+            <div className="flex justify-between text-sm mb-1"><span style={{ color: C.inkSoft }}>Ganancia bruta (real)</span><span style={{ color: C.ink }}>{fmtCOP(gananciaBrutaReal)}</span></div>
+            <div className="flex justify-between text-sm mb-1">
+              <span style={{ color: C.inkSoft }}>Comisión ({order.costos.comision || 0}%)</span>
+              <span style={{ color: C.ink }}>{fmtCOP(gasto.comisionValor)}</span>
+            </div>
+            <div className="flex justify-between text-sm font-semibold"><span style={{ color: C.ink }}>Ganancia neta (real)</span><span style={{ color: gananciaNetaReal >= 0 ? C.sage : C.brick }}>{fmtCOP(gananciaNetaReal)}</span></div>
+            <div className="flex items-center justify-between mt-2">
+              <span className="text-xs" style={{ color: C.inkSoft }}>¿Se pagó la comisión?</span>
+              <button
+                onClick={() => onSaveCostos && onSaveCostos({ ...order.costos, comisionPagada: !order.costos.comisionPagada })}
+                className="rounded-full px-3 py-1 text-xs font-medium"
+                style={{ background: order.costos.comisionPagada ? '#E4EBE1' : C.line, color: order.costos.comisionPagada ? C.sage : C.inkSoft }}
+              >
+                {order.costos.comisionPagada ? 'Sí, pagada ✓' : 'Aún no'}
+              </button>
+            </div>
+          </div>
         </div>
       )}
 
@@ -2291,13 +2316,15 @@ function FinanzasResumen({ orders, gastosFijos, transactions }) {
   const totalVendido = orders.reduce((s, o) => s + (Number(o.precio) || 0), 0);
   const totalRecibido = orders.reduce((s, o) => s + (Number(o.abono) || 0), 0);
   const totalPendiente = totalVendido - totalRecibido;
+  // "Costos" que se van sumando a medida que registras costos reales en cada pedido.
   const conCostos = orders.map(o => ({ o, profit: computeOrderProfit(o) })).filter(x => x.profit);
   const totalCostosReales = conCostos.reduce((s, x) => s + x.profit.realCost, 0);
-  const totalGananciaPedidos = conCostos.reduce((s, x) => s + x.profit.ganancia, 0);
+  const totalGananciaNeta = conCostos.reduce((s, x) => s + x.profit.ganancia, 0); // ya es neta: precio − real (incluye comisión)
   const ingresosManual = (transactions || []).filter(t => t.tipo === 'ingreso').reduce((s, t) => s + (Number(t.monto) || 0), 0);
   const egresosManual = (transactions || []).filter(t => t.tipo === 'egreso').reduce((s, t) => s + (Number(t.monto) || 0), 0);
-  const totalGastosFijosMensual = (gastosFijos || []).filter(g => g.activo !== false).reduce((s, g) => s + gastoMensualizado(g), 0);
-  const balanceCaja = totalRecibido + ingresosManual - egresosManual;
+
+  const totalIngresos = totalRecibido + ingresosManual;
+  const totalEgresos = totalCostosReales + egresosManual;
 
   const enEfectivo = orders.reduce((s, o) => ((o.medioPago || 'Efectivo') === 'Efectivo' ? s + (Number(o.abono) || 0) : s), 0)
     + (transactions || []).reduce((s, t) => {
@@ -2312,42 +2339,26 @@ function FinanzasResumen({ orders, gastosFijos, transactions }) {
 
   return (
     <div className="pb-6">
-      <SectionTitle>Dinero por medio de pago</SectionTitle>
+      <SectionTitle>Ingresos y egresos</SectionTitle>
       <div className="grid grid-cols-2 gap-3 mb-3">
+        <StatCard label="Ingresos" value={fmtCOP(totalIngresos)} accent={C.sage} />
+        <StatCard label="Egresos" value={fmtCOP(totalEgresos)} accent={C.brick} />
+      </div>
+
+      <SectionTitle>Dinero por medio de pago</SectionTitle>
+      <div className="grid grid-cols-2 gap-3 mb-5">
         <StatCard label="En efectivo" value={fmtCOP(enEfectivo)} accent={enEfectivo >= 0 ? C.sage : C.brick} />
         <StatCard label="En transferencias" value={fmtCOP(enTransferencias)} accent={enTransferencias >= 0 ? C.sage : C.brick} />
       </div>
-      <p className="text-xs px-1 mb-5" style={{ color: C.inkSoft }}>Incluye los abonos de tus pedidos y los movimientos manuales, cada uno según el medio de pago que le pusiste.</p>
 
       <SectionTitle>Ventas y producción</SectionTitle>
       <div className="grid grid-cols-2 gap-3 mb-3">
-        <StatCard label="Total vendido" value={fmtCOP(totalVendido)} small />
-        <StatCard label="Total recibido" value={fmtCOP(totalRecibido)} small accent={C.sage} />
+        <StatCard label="Total pedidos" value={fmtCOP(totalVendido)} small />
+        <StatCard label="Total costos pedidos" value={fmtCOP(totalCostosReales)} small accent={C.brick} />
+        <StatCard label="Total ganancia pedidos" value={fmtCOP(totalGananciaNeta)} small accent={totalGananciaNeta >= 0 ? C.sage : C.brick} />
         <StatCard label="Por cobrar" value={fmtCOP(totalPendiente)} small accent={C.brick} />
-        <StatCard label="Costo real de pedidos" value={fmtCOP(totalCostosReales)} small accent={C.brick} />
       </div>
-      <StatCard label="Ganancia real de pedidos" value={fmtCOP(totalGananciaPedidos)} accent={totalGananciaPedidos >= 0 ? C.sage : C.brick} />
-
-      <SectionTitle>Caja general</SectionTitle>
-      <div className="grid grid-cols-2 gap-3 mb-3">
-        <StatCard label="Ingresos manuales" value={fmtCOP(ingresosManual)} small accent={C.sage} />
-        <StatCard label="Egresos manuales" value={fmtCOP(egresosManual)} small accent={C.brick} />
-        <StatCard label="Gastos fijos / mes" value={fmtCOP(totalGastosFijosMensual)} small />
-        <StatCard label="Balance de caja" value={fmtCOP(balanceCaja)} small accent={balanceCaja >= 0 ? C.sage : C.brick} />
-      </div>
-
-      <SectionTitle>Ganancia por pedido</SectionTitle>
-      {conCostos.length === 0
-        ? <p className="text-sm px-1" style={{ color: C.inkSoft }}>Aún no has registrado costos reales en ningún pedido.</p>
-        : conCostos.slice().sort((a, b) => (b.o.createdAt || '').localeCompare(a.o.createdAt || '')).map(({ o, profit }) => (
-          <div key={o.id} className="rounded-2xl p-3.5 mb-2.5 flex items-center justify-between gap-2" style={{ background: C.paper, border: `1px solid ${C.line}` }}>
-            <div className="min-w-0">
-              <p className="font-medium truncate" style={{ color: C.ink }}>{o.prenda}</p>
-              <p className="text-xs" style={{ color: C.inkSoft }}>{o.codigo} · Costo real {fmtCOP(profit.realCost)}</p>
-            </div>
-            <p className="font-semibold flex-shrink-0" style={{ color: profit.ganancia >= 0 ? C.sage : C.brick }}>{fmtCOP(profit.ganancia)}</p>
-          </div>
-        ))}
+      <p className="text-xs px-1" style={{ color: C.inkSoft }}>"Total ganancia pedidos" ya es la ganancia neta (con la comisión descontada) de los pedidos donde has registrado costos reales.</p>
     </div>
   );
 }
